@@ -1,361 +1,718 @@
-import os
-import json
-import sqlite3
-import tempfile
-from datetime import datetime
-from pathlib import Path
-
-import pandas as pd
 import streamlit as st
+import sqlite3
+import pandas as pd
+import plotly.express as px
+import re
+from pathlib import Path
+from datetime import datetime, date
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+# ==========================================
+# 1. 기본 설정
+# ==========================================
 
-APP_DIR = Path(__file__).resolve().parent
-DB_PATH = APP_DIR / "complaints.db"
+st.set_page_config(
+    page_title="천산환경 AI 민원 관리 시스템",
+    page_icon="♻️",
+    layout="wide"
+)
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+DB_PATH = DATA_DIR / "complaints.db"
 
 CATEGORIES = [
     "재활용품 미수거",
     "음식물류 미수거",
-    "수거시간 및 배출방법",
-    "생활폐기물 미수거",
-    "중간집하지 및 악취",
-    "기타",
+    "중간집하지 악취",
+    "일반생활폐기물 미수거",
+    "수거 지연",
+    "중간집하지 정리 미흡",
 ]
-PRIORITIES = ["HIGH", "MEDIUM", "LOW"]
 
+# 보고서에 명시된 3개 유형 외 나머지는 시연용 임시 분류
+CATEGORY_KEYWORDS = {
+    "재활용품 미수거": ["재활용", "캔", "페트병", "플라스틱", "종이", "병", "분리수거"],
+    "음식물류 미수거": ["음식물", "음식물쓰레기", "잔반"],
+    "중간집하지 악취": ["악취", "냄새", "악취가"],
+    "일반생활폐기물 미수거": ["생활폐기물", "일반쓰레기", "종량제"],
+    "수거 지연": ["수거 지연", "늦게", "아직 안", "며칠째"],
+    "중간집하지 정리 미흡": ["뒷정리", "정리 미흡", "주변이 지저분", "청소"],
+}
 
-def db_connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+DISTRICTS = ["용현동", "숭의동"]
 
+# ==========================================
+# 2. 데이터베이스
+# ==========================================
+
+def get_connection():
+    return sqlite3.connect(DB_PATH)
 
 def init_db():
-    with db_connect() as conn:
+    with get_connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS complaints (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL,
-                source_type TEXT NOT NULL,
-                raw_text TEXT NOT NULL,
-                dong TEXT,
-                address_detail TEXT,
+                received_at TEXT NOT NULL,
+                complaint_date TEXT NOT NULL,
+                channel TEXT,
+                original_text TEXT NOT NULL,
+                district TEXT,
+                location TEXT,
                 category TEXT,
-                ai_summary TEXT,
                 priority TEXT,
-                notification_text TEXT,
-                status TEXT NOT NULL DEFAULT '접수'
+                summary TEXT,
+                driver_message TEXT,
+                status TEXT DEFAULT '접수',
+                delivered INTEGER DEFAULT 0
             )
         """)
 
-
-def heuristic_parse(raw_text: str) -> dict:
-    """API 키 없이도 텍스트 흐름을 시연하기 위한 규칙 기반 임시 분류기."""
-    text = raw_text.strip()
-    lower = text.lower()
-
-    if any(k in text for k in ["악취", "냄새", "중간집하", "집하장"]):
-        category = "중간집하지 및 악취"
-    elif any(k in text for k in ["음식물", "음쓰"]):
-        category = "음식물류 미수거"
-    elif any(k in text for k in ["재활용", "캔", "페트병", "플라스틱", "종이"]):
-        category = "재활용품 미수거"
-    elif any(k in text for k in ["배출방법", "수거시간", "몇 시", "몇시", "배출 시간"]):
-        category = "수거시간 및 배출방법"
-    elif any(k in text for k in ["생활폐기물", "쓰레기", "종량제", "일반폐기물"]):
-        category = "생활폐기물 미수거"
-    else:
-        category = "기타"
-
-    dong = ""
-    for candidate in ["용현동", "숭의동", "학익동", "주안동", "도화동", "관교동", "문학동"]:
-        if candidate in text:
-            dong = candidate
-            break
-
-    priority = "MEDIUM"
-    if any(k in text for k in ["사고", "불", "화재", "위험", "도로 막힘", "긴급"]):
-        priority = "HIGH"
-    elif any(k in text for k in ["악취", "넘쳐", "며칠째", "계속", "민원 반복"]):
-        priority = "HIGH"
-    elif any(k in text for k in ["문의", "궁금", "방법", "언제"]):
-        priority = "LOW"
-
-    summary = text if len(text) <= 100 else text[:97] + "..."
-    return {
-        "dong": dong or "확인 필요",
-        "address_detail": "원문에서 위치를 확인하세요",
-        "category": category,
-        "ai_summary": summary,
-        "priority": priority,
-        "analysis_mode": "규칙 기반 데모(외부 AI 미사용)",
-    }
-
-
-def analyze_with_openai(raw_text: str) -> dict:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY가 설정되지 않았습니다. 텍스트는 데모 모드로 분석할 수 있고, 실제 AI 분석에는 API 키가 필요합니다.")
-    from openai import OpenAI
-
-    client = OpenAI(api_key=api_key)
-    response = client.chat.completions.create(
-        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "당신은 생활폐기물 민원 접수 보조 시스템이다. 민원 원문에서 확인되는 사실만 추출한다. "
-                    "주소나 동 이름이 없으면 추측하지 말고 '확인 필요'라고 쓴다. "
-                    "긴급도는 실제 위험 단서가 명확할 때만 HIGH로 지정한다. "
-                    "개인정보를 불필요하게 반복하지 말고, 현장 담당자가 이해할 수 있게 간결하게 작성한다. "
-                    "반드시 JSON 객체만 출력한다."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"""
-민원 원문:
-{raw_text}
-
-다음 키를 가진 JSON으로 답해줘.
-- dong: 행정동, 모르면 "확인 필요"
-- address_detail: 세부 주소/위치, 모르면 "확인 필요"
-- category: 아래 중 하나만 선택: {", ".join(CATEGORIES)}
-- ai_summary: 한 문장 요약
-- priority: HIGH, MEDIUM, LOW 중 하나
-""",
-            },
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.1,
-    )
-    data = json.loads(response.choices[0].message.content)
-    if data.get("category") not in CATEGORIES:
-        data["category"] = "기타"
-    if data.get("priority") not in PRIORITIES:
-        data["priority"] = "MEDIUM"
-    for key in ["dong", "address_detail", "ai_summary"]:
-        if not data.get(key):
-            data[key] = "확인 필요"
-    data["analysis_mode"] = "OpenAI API"
-    return data
-
-
-def transcribe_audio(uploaded_file) -> str:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("음성 변환에는 OPENAI_API_KEY가 필요합니다. .env 파일 설정 안내를 확인하세요.")
-    from openai import OpenAI
-
-    client = OpenAI(api_key=api_key)
-    suffix = Path(uploaded_file.name).suffix or ".wav"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
-        temp.write(uploaded_file.getvalue())
-        temp_path = temp.name
-    try:
-        with open(temp_path, "rb") as audio:
-            result = client.audio.transcriptions.create(
-                model=os.getenv("OPENAI_STT_MODEL", "whisper-1"),
-                file=audio,
-                language="ko",
-            )
-        return result.text
-    finally:
-        try:
-            os.remove(temp_path)
-        except OSError:
-            pass
-
-
-def make_notification(data: dict, complaint_id=None) -> str:
-    number = f"민원번호: {complaint_id}\n" if complaint_id is not None else ""
-    return (
-        f"[현장 민원 전달]\n{number}"
-        f"우선순위: {data.get('priority', 'MEDIUM')}\n"
-        f"행정동: {data.get('dong', '확인 필요')}\n"
-        f"위치: {data.get('address_detail', '확인 필요')}\n"
-        f"유형: {data.get('category', '기타')}\n"
-        f"내용: {data.get('ai_summary', '')}\n"
-        "※ 출동 전 주소·내용을 담당자가 확인해 주세요."
-    )
-
-
-def save_complaint(source_type, raw_text, data):
-    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with db_connect() as conn:
-        cur = conn.execute(
-            """INSERT INTO complaints
-            (created_at, source_type, raw_text, dong, address_detail, category, ai_summary, priority, notification_text, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                created_at, source_type, raw_text, data.get("dong", "확인 필요"),
-                data.get("address_detail", "확인 필요"), data.get("category", "기타"),
-                data.get("ai_summary", ""), data.get("priority", "MEDIUM"),
-                make_notification(data), "접수",
-            ),
-        )
-        complaint_id = cur.lastrowid
-        conn.execute(
-            "UPDATE complaints SET notification_text=? WHERE id=?",
-            (make_notification(data, complaint_id), complaint_id),
-        )
-    return complaint_id
-
-
-def load_complaints():
-    with db_connect() as conn:
-        rows = conn.execute("SELECT * FROM complaints ORDER BY id DESC").fetchall()
-    return pd.DataFrame([dict(r) for r in rows])
-
-
-def update_status(complaint_id, status):
-    with db_connect() as conn:
-        conn.execute("UPDATE complaints SET status=? WHERE id=?", (status, int(complaint_id)))
-
-
-st.set_page_config(page_title="AI 민원 자동화 데모", page_icon="♻️", layout="wide")
 init_db()
 
-st.title("♻️ AI 기반 생활폐기물 민원 자동화")
-st.caption("시연용 웹 프로그램 · 음성/텍스트 접수 → 민원 정보 정리 → 현장 전달 메시지 생성")
-st.warning(
-    "주의: 이 프로그램은 시범용입니다. AI 분류와 긴급도는 틀릴 수 있으므로 현장 전달 전 사람이 확인해야 합니다. "
-    "현재 버전은 실제 전화 자동 수신이나 기사 휴대전화로의 자동 발송을 하지 않습니다."
+# ==========================================
+# 3. 민원 자동 분석 엔진
+# ==========================================
+
+def analyze_complaint(text):
+    text = text.strip()
+    lower_text = text.lower()
+
+    # 행정동 추출
+    district = next(
+        (d for d in DISTRICTS if d in text),
+        "미확인"
+    )
+
+    # 세부 위치 추출: 동 이름 뒤의 문장을 참고용으로 저장
+    location = "세부 위치 확인 필요"
+    for district_name in DISTRICTS:
+        match = re.search(
+            district_name + r"\s*(.{2,30})",
+            text
+        )
+        if match:
+            location = match.group(1).strip()
+            break
+
+    # 민원 유형 분류
+    category = "기타 / 담당자 확인"
+
+    for name, keywords in CATEGORY_KEYWORDS.items():
+        if any(keyword in lower_text for keyword in keywords):
+            category = name
+            break
+
+    # 긴급도 규칙
+    high_words = [
+        "긴급", "위험", "악취가 심", "도로를 막",
+        "통행 불가", "며칠째", "심각", "넘쳐"
+    ]
+    medium_words = [
+        "불편", "민원", "반복", "방치",
+        "확인 요청", "주민들이"
+    ]
+
+    if any(word in text for word in high_words):
+        priority = "HIGH"
+    elif any(word in text for word in medium_words):
+        priority = "MEDIUM"
+    else:
+        priority = "LOW"
+
+    # 핵심 요약
+    summary = (
+        f"{district} {location} 관련 "
+        f"{category} 민원"
+    )
+
+    # 기사 전달 메시지
+    prefix = {
+        "HIGH": "[긴급]",
+        "MEDIUM": "[확인 요청]",
+        "LOW": "[일반]"
+    }[priority]
+
+    driver_message = (
+        f"{prefix} {district} {location} "
+        f"{category} 민원입니다. "
+        f"현장 확인 후 필요한 조치 부탁드립니다."
+    )
+
+    return {
+        "district": district,
+        "location": location,
+        "category": category,
+        "priority": priority,
+        "summary": summary,
+        "driver_message": driver_message
+    }
+
+# ==========================================
+# 4. 데이터 조회 및 저장
+# ==========================================
+
+def save_complaint(data):
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT INTO complaints (
+                received_at, complaint_date, channel,
+                original_text, district, location,
+                category, priority, summary,
+                driver_message, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            str(data["complaint_date"]),
+            data["channel"],
+            data["original_text"],
+            data["district"],
+            data["location"],
+            data["category"],
+            data["priority"],
+            data["summary"],
+            data["driver_message"],
+            "접수"
+        ))
+
+def get_complaints():
+    with get_connection() as conn:
+        return pd.read_sql_query(
+            "SELECT * FROM complaints ORDER BY id DESC",
+            conn
+        )
+
+def update_status(complaint_id, status):
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE complaints SET status=? WHERE id=?",
+            (status, int(complaint_id))
+        )
+
+def update_delivery(complaint_id, delivered):
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE complaints SET delivered=? WHERE id=?",
+            (int(delivered), int(complaint_id))
+        )
+
+# ==========================================
+# 5. 가상 시연 데이터
+# ==========================================
+
+def create_demo_data():
+    with get_connection() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM complaints"
+        ).fetchone()[0]
+
+        if count > 0:
+            return False
+
+    # 보고서 집계 수치를 재현하기 위한 가상 데이터
+    types = (
+        ["재활용품 미수거"] * 9
+        + ["음식물류 미수거"] * 6
+        + ["중간집하지 악취"] * 3
+        + ["일반생활폐기물 미수거"] * 3
+        + ["수거 지연"] * 3
+        + ["중간집하지 정리 미흡"] * 3
+    )
+
+    districts = ["용현동"] * 20 + ["숭의동"] * 7
+    channels = ["지자체 경유"] * 17 + ["직접 접수"] * 10
+
+    templates = {
+        "재활용품 미수거": "재활용품이 수거되지 않고 쌓여 있습니다.",
+        "음식물류 미수거": "음식물 쓰레기가 수거되지 않았습니다.",
+        "중간집하지 악취": "중간집하지 주변에서 악취가 심하게 발생합니다.",
+        "일반생활폐기물 미수거": "일반 생활폐기물이 수거되지 않았습니다.",
+        "수거 지연": "폐기물 수거가 예정 시간보다 늦어지고 있습니다.",
+        "중간집하지 정리 미흡": "수거 후 주변 뒷정리가 미흡합니다."
+    }
+
+    import random
+    random.seed(42)
+
+    random.shuffle(types)
+    random.shuffle(districts)
+    random.shuffle(channels)
+
+    for i in range(27):
+        category = types[i]
+        district = districts[i]
+        channel = channels[i]
+
+        original = (
+            f"{district} ○○아파트 앞 "
+            f"{templates[category]}"
+        )
+
+        analysis = analyze_complaint(original)
+
+        # 가상 데이터의 분류값은 보고서 시연용 집계와 일치하도록 지정
+        analysis["category"] = category
+
+        received_date = date(2026, 10, 1).replace(
+            day=(i % 27) + 1
+        )
+
+        with get_connection() as conn:
+            conn.execute("""
+                INSERT INTO complaints (
+                    received_at, complaint_date, channel,
+                    original_text, district, location,
+                    category, priority, summary,
+                    driver_message, status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                str(received_date),
+                channel,
+                original,
+                district,
+                "○○아파트 앞",
+                category,
+                analysis["priority"],
+                analysis["summary"],
+                analysis["driver_message"],
+                "완료" if i < 12 else "접수"
+            ))
+
+    return True
+
+# ==========================================
+# 6. 화면 디자인
+# ==========================================
+
+st.markdown("""
+<style>
+.stApp {
+    background-color: #f7f9f8;
+}
+[data-testid="stSidebar"] {
+    background-color: #123d32;
+}
+[data-testid="stSidebar"] * {
+    color: white !important;
+}
+.main-title {
+    font-size: 29px;
+    font-weight: 800;
+    color: #174b3b;
+}
+.sub-title {
+    color: #687b72;
+    font-size: 14px;
+}
+.metric-card {
+    background: white;
+    border-radius: 12px;
+    padding: 18px;
+    border: 1px solid #e6ece8;
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown(
+    '<div class="main-title">♻️ 천산환경 AI 민원 관리 시스템</div>',
+    unsafe_allow_html=True
 )
+st.markdown(
+    '<div class="sub-title">생활폐기물 수거 민원 자동 분석 및 이력 관리</div>',
+    unsafe_allow_html=True
+)
+st.divider()
+
+# ==========================================
+# 7. 사이드바
+# ==========================================
 
 with st.sidebar:
-    st.header("설정 및 안내")
-    api_key_exists = bool(os.getenv("OPENAI_API_KEY", "").strip())
-    st.write("OpenAI API 키:", "설정됨" if api_key_exists else "미설정")
-    st.write("텍스트 입력:", "규칙 기반 데모 가능")
-    st.write("음성 변환:", "API 키 필요")
-    st.write("AI 분석:", "API 키가 있으면 OpenAI 사용 가능")
-    st.markdown("---")
-    st.markdown("**처음 실행하는 경우**")
-    st.markdown("1. `requirements.txt` 설치\n2. `.env.example`을 `.env`로 복사\n3. API 키를 넣으면 음성 변환과 AI 분석 활성화")
+    st.title("♻️ 천산환경")
+    st.caption("AI 민원 관리 시스템")
+    st.divider()
 
-tab_new, tab_records, tab_guide = st.tabs(["➕ 민원 접수", "📋 접수 현황", "ℹ️ 사용 안내"])
+    menu = st.radio(
+        "메뉴",
+        [
+            "대시보드",
+            "민원 접수 및 AI 분석",
+            "민원 관리",
+            "현장 기사 전달",
+            "통계 및 분석"
+        ]
+    )
 
-with tab_new:
-    st.subheader("새 민원 접수")
-    input_method = st.radio("입력 방식", ["텍스트 입력", "음성 파일 업로드"], horizontal=True)
-    raw_text = ""
-    source_type = "텍스트"
+    st.divider()
+    st.caption("DEMO VERSION 1.0")
 
-    if input_method == "텍스트 입력":
-        raw_text = st.text_area(
-            "민원 내용",
-            placeholder="예: 용현동 102-15 육교 쪽 쉼터인데 음식물 수거 후 뒷정리가 안 돼 악취가 심해요.",
-            height=130,
+# ==========================================
+# 8. 데이터 준비
+# ==========================================
+
+df = get_complaints()
+
+if menu == "대시보드":
+
+    st.subheader("📊 민원 현황 대시보드")
+
+    total = len(df)
+    pending = (
+        len(df[df["status"] != "완료"])
+        if total else 0
+    )
+    urgent = (
+        len(df[df["priority"] == "HIGH"])
+        if total else 0
+    )
+    completed = (
+        len(df[df["status"] == "완료"])
+        if total else 0
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric("전체 민원", f"{total}건")
+    c2.metric("미처리 민원", f"{pending}건")
+    c3.metric("긴급 민원", f"{urgent}건")
+    c4.metric("완료 민원", f"{completed}건")
+
+    st.divider()
+
+    if total:
+        left, right = st.columns(2)
+
+        with left:
+            st.markdown("#### 행정동별 민원")
+            district_data = df["district"].value_counts()
+            fig = px.bar(
+                x=district_data.index,
+                y=district_data.values,
+                labels={"x": "행정동", "y": "민원 건수"},
+                color_discrete_sequence=["#21966b"]
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        with right:
+            st.markdown("#### 민원 유형별 현황")
+            category_data = df["category"].value_counts()
+            fig = px.pie(
+                names=category_data.index,
+                values=category_data.values,
+                hole=0.45
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("#### 최근 접수 민원")
+        st.dataframe(
+            df[[
+                "complaint_date", "district",
+                "category", "priority", "status"
+            ]].head(10),
+            use_container_width=True,
+            hide_index=True
         )
-        use_ai = st.checkbox("OpenAI API로 분석 (API 키가 설정된 경우)", value=bool(os.getenv("OPENAI_API_KEY", "").strip()))
-        if st.button("민원 분석 및 접수", type="primary", disabled=not raw_text.strip()):
-            try:
-                if use_ai:
-                    parsed = analyze_with_openai(raw_text.strip())
-                else:
-                    parsed = heuristic_parse(raw_text.strip())
-                complaint_id = save_complaint(source_type, raw_text.strip(), parsed)
-                st.session_state["last_result"] = {"id": complaint_id, "raw_text": raw_text.strip(), **parsed}
-                st.success(f"민원 #{complaint_id} 접수 완료")
-            except Exception as e:
-                st.error(f"처리 중 오류: {e}")
-
     else:
-        uploaded = st.file_uploader("민원 음성 파일", type=["wav", "mp3", "m4a", "mpeg", "mpga", "webm"])
-        st.caption("음성 변환은 OpenAI API 키 및 인터넷 연결이 필요하며, API 사용료가 발생할 수 있습니다.")
-        use_ai_audio = st.checkbox("변환 후 OpenAI로 민원 정보 분석", value=True)
-        if uploaded is not None and st.button("음성 변환 · 분석 · 접수", type="primary"):
-            try:
-                raw_text = transcribe_audio(uploaded)
-                st.text_area("음성 인식 결과(필요 시 수정)", value=raw_text, height=120, key="transcribed_preview")
-                if use_ai_audio:
-                    parsed = analyze_with_openai(raw_text)
-                else:
-                    parsed = heuristic_parse(raw_text)
-                complaint_id = save_complaint("음성 파일", raw_text, parsed)
-                st.session_state["last_result"] = {"id": complaint_id, "raw_text": raw_text, **parsed}
-                st.success(f"음성 변환 및 민원 #{complaint_id} 접수 완료")
-            except Exception as e:
-                st.error(f"처리 중 오류: {e}")
+        st.info("등록된 민원이 없습니다. 민원을 접수하거나 시연 데이터를 생성해주세요.")
 
-    if "last_result" in st.session_state:
-        result = st.session_state["last_result"]
-        st.markdown("---")
-        st.subheader(f"분석 결과 · 민원 #{result['id']}")
-        st.caption(f"분석 방식: {result.get('analysis_mode', '확인 필요')}")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("행정동", result.get("dong", "확인 필요"))
-        c2.metric("민원 유형", result.get("category", "기타"))
-        c3.metric("우선순위", result.get("priority", "MEDIUM"))
-        st.write("**세부 위치**", result.get("address_detail", "확인 필요"))
-        st.write("**핵심 요약**", result.get("ai_summary", ""))
-        message = make_notification(result, result["id"])
-        st.text_area("현장 기사 전달용 메시지(자동 발송 아님)", value=message, height=180, key="last_notification")
-        st.download_button(
-            "알림 메시지 다운로드",
-            data=message,
-            file_name=f"complaint_{result['id']}_notification.txt",
-            mime="text/plain",
-        )
-
-with tab_records:
-    st.subheader("민원 접수 현황")
-    df = load_complaints()
-    if df.empty:
-        st.info("아직 접수된 민원이 없습니다. '민원 접수' 탭에서 샘플 민원을 등록해 보세요.")
-    else:
-        col1, col2, col3 = st.columns(3)
-        col1.metric("누적 접수", f"{len(df)}건")
-        col2.metric("미처리", f"{(df['status'] != '완료').sum()}건")
-        col3.metric("긴급(HIGH)", f"{(df['priority'] == 'HIGH').sum()}건")
-        visible_cols = ["id", "created_at", "source_type", "dong", "category", "priority", "ai_summary", "status"]
-        st.dataframe(df[visible_cols], use_container_width=True, hide_index=True)
-        st.download_button(
-            "접수 내역 CSV 다운로드",
-            data=df.to_csv(index=False).encode("utf-8-sig"),
-            file_name="complaints_export.csv",
-            mime="text/csv",
-        )
-        st.markdown("#### 처리 상태 변경")
-        selected_id = st.selectbox("민원 번호", df["id"].tolist())
-        selected_status = st.selectbox("새 상태", ["접수", "전달 대기", "처리 중", "완료"])
-        if st.button("상태 저장"):
-            update_status(selected_id, selected_status)
-            st.success(f"민원 #{selected_id} 상태를 '{selected_status}'(으)로 변경했습니다.")
+    if st.button("시연용 가상 민원 27건 생성", type="primary"):
+        if create_demo_data():
+            st.success("가상 시연 데이터 27건을 생성했습니다.")
             st.rerun()
+        else:
+            st.warning("기존 데이터가 있어 생성하지 않았습니다. 중복 생성을 방지했습니다.")
+
+# ==========================================
+# 9. 민원 접수 및 AI 분석
+# ==========================================
+
+elif menu == "민원 접수 및 AI 분석":
+
+    st.subheader("📝 민원 접수 및 자동 분석")
+
+    with st.form("complaint_form"):
+        complaint_date = st.date_input("접수 일자", value=date.today())
+
+        channel = st.selectbox(
+            "민원 유입 경로",
+            ["직접 접수", "지자체 경유", "주민센터 경유", "기타"]
+        )
+
+        original_text = st.text_area(
+            "민원 원문",
+            placeholder="예: 용현동 ○○아파트 앞 재활용품이 수거되지 않았습니다.",
+            height=150
+        )
+
+        submitted = st.form_submit_button(
+            "AI 자동 분석 실행",
+            type="primary"
+        )
+
+    if submitted:
+        if not original_text.strip():
+            st.error("민원 내용을 입력해주세요.")
+        else:
+            result = analyze_complaint(original_text)
+
+            st.session_state["analysis_result"] = result
+            st.session_state["analysis_original"] = original_text
+            st.session_state["analysis_date"] = complaint_date
+            st.session_state["analysis_channel"] = channel
+
+    if "analysis_result" in st.session_state:
+        result = st.session_state["analysis_result"]
+
+        st.divider()
+        st.markdown("### 🤖 자동 분석 결과")
+
+        a, b, c = st.columns(3)
+        a.metric("행정동", result["district"])
+        b.metric("민원 유형", result["category"])
+        c.metric("긴급도", result["priority"])
+
+        st.info(f"📍 세부 위치: {result['location']}")
+
+        st.markdown("#### 핵심 요약")
+        st.success(result["summary"])
+
+        st.markdown("#### 현장 기사 전달 메시지")
+        st.code(result["driver_message"])
+
+        if st.button("분석 결과 민원 DB에 저장", type="primary"):
+            save_complaint({
+                "complaint_date": st.session_state["analysis_date"],
+                "channel": st.session_state["analysis_channel"],
+                "original_text": st.session_state["analysis_original"],
+                **result
+            })
+            st.success("민원이 SQLite 데이터베이스에 저장되었습니다.")
+            st.session_state.pop("analysis_result", None)
+            st.rerun()
+
+# ==========================================
+# 10. 민원 관리
+# ==========================================
+
+elif menu == "민원 관리":
+
+    st.subheader("📋 민원 접수 및 처리 관리")
+
+    if not df.empty:
+        search = st.text_input("민원 검색", placeholder="행정동, 민원 내용, 유형 검색")
+
+        filtered = df.copy()
+
+        if search:
+            mask = (
+                filtered["original_text"].str.contains(search, case=False, na=False)
+                | filtered["district"].str.contains(search, case=False, na=False)
+                | filtered["category"].str.contains(search, case=False, na=False)
+            )
+            filtered = filtered[mask]
+
+        district_filter = st.selectbox(
+            "행정동 필터",
+            ["전체"] + sorted(df["district"].dropna().unique().tolist())
+        )
+
+        if district_filter != "전체":
+            filtered = filtered[
+                filtered["district"] == district_filter
+            ]
+
+        st.dataframe(
+            filtered[[
+                "id", "complaint_date", "district",
+                "category", "priority", "status"
+            ]],
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.divider()
+        st.markdown("#### 민원 처리 상태 변경")
+
+        selected_id = st.selectbox(
+            "민원 번호 선택",
+            filtered["id"].tolist()
+        )
+
+        selected_status = st.selectbox(
+            "변경할 상태",
+            ["접수", "처리중", "완료"]
+        )
+
+        if st.button("처리 상태 저장"):
+            update_status(selected_id, selected_status)
+            st.success("처리 상태를 변경했습니다.")
+            st.rerun()
+
         selected = df[df["id"] == selected_id].iloc[0]
-        st.markdown("#### 선택한 민원 상세")
-        st.write("**원문:**", selected["raw_text"])
-        st.text_area("현장 전달 메시지", value=selected["notification_text"], height=170, key=f"record_message_{selected_id}")
 
-with tab_guide:
-    st.subheader("이 프로그램의 기능과 한계")
-    st.markdown("""
-**현재 포함된 기능**
-- 텍스트 민원 입력
-- 음성 파일 업로드 후 한국어 음성 인식(OpenAI API 설정 시)
-- AI 분석 또는 API 키 없이 실행하는 규칙 기반 데모 분석
-- 행정동·위치·민원 유형·요약·우선순위 결과 표시
-- 현장 전달 메시지 생성 및 TXT 다운로드
-- SQLite 기반 접수 내역 저장, 상태 변경, CSV 다운로드
+        with st.expander("선택 민원 상세 내용"):
+            st.write("민원 원문:", selected["original_text"])
+            st.write("핵심 요약:", selected["summary"])
+            st.write("기사 전달:", selected["driver_message"])
 
-**현재 포함되지 않은 기능**
-- 실제 전화 회선 연결 및 전화 자동 수신
-- 카카오톡/텔레그램 자동 발송
-- 실제 기사 배정, GPS 위치 추적, 외부 업무 시스템 연동
-- 규칙 기반 데모 분석의 높은 정확도 보장
+        csv = filtered.to_csv(
+            index=False
+        ).encode("utf-8-sig")
 
-**개인정보 주의**
-- 처음에는 실제 주민 이름·전화번호·상세 개인정보가 없는 가상 데이터로 시험하세요.
-- 실제 민원 음성을 외부 API로 전송하기 전에는 회사의 개인정보 처리 기준 및 승인 여부를 확인하세요.
-- API 키는 코드에 직접 적지 말고 `.env` 파일에 보관하세요.
-""")
-    st.markdown("#### 빠른 테스트용 예시")
-    st.code("용현동 102-15 육교 쪽 쉼터인데 음식물 수거 후 뒷정리가 안 돼 악취가 심해요.", language="text")
-    st.caption("이 예시는 실제 민원이 아닌 테스트용 문장입니다.")
+        st.download_button(
+            "민원 목록 CSV 다운로드",
+            csv,
+            "complaints.csv",
+            "text/csv"
+        )
+
+    else:
+        st.info("등록된 민원이 없습니다.")
+
+# ==========================================
+# 11. 현장 기사 전달
+# ==========================================
+
+elif menu == "현장 기사 전달":
+
+    st.subheader("🚚 현장 기사 전달 관리")
+
+    if not df.empty:
+        candidates = df[df["status"] != "완료"]
+
+        if not candidates.empty:
+            selected_id = st.selectbox(
+                "전달할 민원 선택",
+                candidates["id"].tolist()
+            )
+
+            selected = candidates[
+                candidates["id"] == selected_id
+            ].iloc[0]
+
+            st.markdown("#### 전달 대상 민원")
+            st.write(selected["original_text"])
+
+            st.markdown("#### 기사 전달 메시지")
+
+            message = st.text_area(
+                "메시지",
+                value=selected["driver_message"],
+                height=120
+            )
+
+            st.caption("현재 버전은 실제 문자·알림톡 발송이 아닌 복사 및 전달 이력 관리용 시연 기능입니다.")
+
+            st.code(message)
+
+            st.text_input(
+                "기사 전달 메시지 복사",
+                value=message,
+                key="copy_message"
+            )
+
+            delivered = st.checkbox(
+                "현장 기사 전달 완료로 기록",
+                value=bool(selected["delivered"])
+            )
+
+            if st.button("전달 상태 저장"):
+                update_delivery(selected_id, delivered)
+                st.success("전달 상태를 저장했습니다.")
+                st.rerun()
+
+        else:
+            st.info("현재 전달 대기 중인 민원이 없습니다.")
+    else:
+        st.info("등록된 민원이 없습니다.")
+
+# ==========================================
+# 12. 통계 및 분석
+# ==========================================
+
+elif menu == "통계 및 분석":
+
+    st.subheader("📈 민원 통계 및 원인 분석")
+
+    if not df.empty:
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.markdown("#### 행정동별 발생 비율")
+            district_stats = (
+                df["district"].value_counts(normalize=True) * 100
+            ).round(1)
+
+            st.dataframe(
+                district_stats.rename("발생 비율(%)"),
+                use_container_width=True
+            )
+
+        with col2:
+            st.markdown("#### 민원 유형별 발생 건수")
+            category_stats = df["category"].value_counts()
+            st.dataframe(
+                category_stats.rename("건수"),
+                use_container_width=True
+            )
+
+        st.divider()
+        st.markdown("#### 월별 민원 발생 추이")
+
+        monthly = df.copy()
+        monthly["month"] = pd.to_datetime(
+            monthly["complaint_date"],
+            errors="coerce"
+        ).dt.to_period("M").astype(str)
+
+        monthly_stats = (
+            monthly.groupby("month")
+            .size()
+            .reset_index(name="건수")
+        )
+
+        fig = px.line(
+            monthly_stats,
+            x="month",
+            y="건수",
+            markers=True,
+            labels={"month": "월", "건수": "민원 건수"}
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.divider()
+
+        st.markdown("#### 유입 채널별 현황")
+        channel_stats = df["channel"].value_counts()
+        fig = px.bar(
+            x=channel_stats.index,
+            y=channel_stats.values,
+            labels={"x": "유입 경로", "y": "건수"},
+            color_discrete_sequence=["#21966b"]
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.download_button(
+            "전체 통계 데이터 CSV 다운로드",
+            df.to_csv(index=False).encode("utf-8-sig"),
+            "complaint_statistics.csv",
+            "text/csv"
+        )
+
+    else:
+        st.info("통계를 확인하려면 먼저 민원을 등록하거나 시연 데이터를 생성해주세요.")
+
+# ==========================================
+# 13. 하단 안내
+# ==========================================
+
+st.divider()
+st.caption(
+    "㈜천산환경 AI 민원 자동 분석·관리 시스템 | "
+    "시연용 버전 1.0 | 규칙 기반 분석 엔진"
+)
