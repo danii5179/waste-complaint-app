@@ -21,13 +21,12 @@ CATEGORIES = [
     "재활용품 미수거",
     "음식물류 미수거",
     "일반폐기물 미수거",
-    "대형폐기물 수거 지연",
     "중간집하지 악취",
     "기타 민원"
 ]
 
 DONGS = ["용현동", "숭의동"]
-CHANNELS = ["지자체 경유", "전화", "문자", "기타"]
+CHANNELS = ["지자체 경유", "전화", "기타"]
 STATUSES = ["접수", "확인 중", "처리 중", "처리 완료"]
 
 
@@ -66,6 +65,21 @@ def init_db():
             message TEXT,
             dispatched_at TEXT
         )
+    """)
+
+    # 이전 버전 데이터 정리
+    # 대형폐기물 민원은 기타 민원으로 변경
+    cur.execute("""
+        UPDATE complaints
+        SET category = '기타 민원'
+        WHERE category = '대형폐기물 수거 지연'
+    """)
+
+    # 문자 접수는 운영하지 않으므로 기타 경로로 변경
+    cur.execute("""
+        UPDATE complaints
+        SET channel = '기타'
+        WHERE channel = '문자'
     """)
 
     conn.commit()
@@ -129,24 +143,28 @@ def create_demo_data():
         conn.close()
         return
 
+    # 대형폐기물 항목을 제외한 27건의 시연 데이터
     demo_categories = (
         ["재활용품 미수거"] * 9
         + ["음식물류 미수거"] * 6
         + ["중간집하지 악취"] * 3
         + ["일반폐기물 미수거"] * 3
-        + ["대형폐기물 수거 지연"] * 3
-        + ["기타 민원"] * 3
+        + ["기타 민원"] * 6
     )
 
     demo_dongs = ["용현동"] * 20 + ["숭의동"] * 7
 
     demo_contents = {
-        "재활용품 미수거": "재활용품이 수거되지 않고 쌓여 있어 수거 요청합니다.",
-        "음식물류 미수거": "음식물 쓰레기가 수거되지 않아 악취가 발생합니다.",
-        "중간집하지 악취": "중간집하지 주변에서 심한 악취가 발생합니다.",
-        "일반폐기물 미수거": "일반 생활폐기물이 수거되지 않았습니다.",
-        "대형폐기물 수거 지연": "신청한 대형폐기물이 아직 수거되지 않았습니다.",
-        "기타 민원": "생활폐기물 수거와 관련하여 확인을 요청합니다."
+        "재활용품 미수거":
+            "재활용품이 수거되지 않고 쌓여 있어 수거 요청합니다.",
+        "음식물류 미수거":
+            "음식물 쓰레기가 수거되지 않아 악취가 발생합니다.",
+        "중간집하지 악취":
+            "중간집하지 주변에서 심한 악취가 발생합니다.",
+        "일반폐기물 미수거":
+            "일반 생활폐기물이 수거되지 않았습니다.",
+        "기타 민원":
+            "생활폐기물 수거와 관련하여 확인을 요청합니다."
     }
 
     for i in range(27):
@@ -155,11 +173,8 @@ def create_demo_data():
         location = f"{dong} 주민센터 인근"
         content = demo_contents[category]
 
-        channel = (
-            "지자체 경유" if i < 17
-            else "전화" if i < 21
-            else "문자"
-        )
+        # 지자체 경유 17건, 전화 10건
+        channel = "지자체 경유" if i < 17 else "전화"
 
         received_date = (
             date(2026, 10, 1) + timedelta(days=i)
@@ -194,10 +209,12 @@ def create_demo_data():
 
 def load_complaints():
     conn = get_connection()
+
     df = pd.read_sql_query(
         "SELECT * FROM complaints ORDER BY id DESC",
         conn
     )
+
     conn.close()
     return df
 
@@ -220,35 +237,42 @@ def get_complaint(complaint_id):
 
 
 # =====================================================
-# 공통 Plotly 그래프 스타일
+# 공통 그래프 스타일
 # =====================================================
 
-def style_horizontal_chart(fig, height=400, left_margin=130):
+def style_horizontal_chart(fig, height=430, left_margin=170):
     fig.update_traces(
         textposition="outside",
-        cliponaxis=False
+        cliponaxis=False,
+        textfont=dict(size=15)
     )
 
     fig.update_layout(
         height=height,
         margin=dict(
             l=left_margin,
-            r=80,
-            t=60,
+            r=90,
+            t=65,
             b=55
         ),
         xaxis_title="민원 건수",
         yaxis_title="",
         showlegend=False,
+        bargap=0.35,
         yaxis=dict(
             automargin=True,
-            ticklabelposition="inside",
-            tickfont=dict(size=13)
+            ticklabelposition="outside",
+            tickfont=dict(
+                size=16,
+                color="#222222"
+            ),
+            categoryorder="total ascending"
         ),
         xaxis=dict(
             automargin=True,
             tickangle=0,
-            rangemode="tozero"
+            rangemode="tozero",
+            tickfont=dict(size=13)
         )
     )
 
@@ -258,12 +282,14 @@ def style_horizontal_chart(fig, height=400, left_margin=130):
 def style_vertical_chart(fig, height=380):
     fig.update_traces(
         textposition="outside",
-        cliponaxis=False
+        cliponaxis=False,
+        textfont=dict(size=14)
     )
 
     fig.update_layout(
         height=height,
         margin=dict(l=45, r=45, t=60, b=65),
+        bargap=0.35,
         xaxis=dict(
             tickangle=0,
             automargin=True,
@@ -508,11 +534,9 @@ def show_complaint_management():
         st.warning("검색 결과가 없습니다.")
         return
 
-    complaint_ids = df["id"].tolist()
-
     selected_id = st.selectbox(
         "관리할 민원 선택",
-        complaint_ids
+        df["id"].tolist()
     )
 
     complaint = get_complaint(selected_id)
@@ -737,7 +761,7 @@ def show_statistics():
     fig = style_horizontal_chart(
         fig,
         height=350,
-        left_margin=130
+        left_margin=170
     )
 
     st.plotly_chart(fig, use_container_width=True)
@@ -774,8 +798,31 @@ def show_statistics():
 
     fig = style_horizontal_chart(
         fig,
-        height=430,
-        left_margin=160
+        height=520,
+        left_margin=200
+    )
+
+    # 유형별 그래프 제목과 글자 가독성 추가 개선
+    fig.update_layout(
+        title=dict(
+            text="민원 유형별 건수",
+            x=0.5,
+            xanchor="center",
+            font=dict(size=20)
+        ),
+        yaxis=dict(
+            tickfont=dict(
+                size=17,
+                color="#111111"
+            ),
+            automargin=True,
+            ticklabelposition="outside"
+        ),
+        xaxis=dict(
+            title="민원 건수",
+            tickfont=dict(size=14),
+            rangemode="tozero"
+        )
     )
 
     st.plotly_chart(fig, use_container_width=True)
