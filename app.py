@@ -29,6 +29,160 @@ DONGS = ["용현동", "숭의동"]
 CHANNELS = ["지자체 경유", "전화", "기타"]
 STATUSES = ["접수", "확인 중", "처리 중", "처리 완료"]
 
+MAIN_BLUE = "#2B579A"
+POINT_GREEN = "#10A337"
+
+
+# =====================================================
+# 화면 디자인 및 모바일 반응형 CSS
+# =====================================================
+
+st.markdown(
+    f"""
+    <style>
+    :root {{
+        --main-blue: {MAIN_BLUE};
+        --point-green: {POINT_GREEN};
+    }}
+
+    /* 전체 기본 글자 */
+    html, body, [class*="css"] {{
+        font-family: "Malgun Gothic", sans-serif;
+    }}
+
+    .stApp {{
+        background-color: #F7F9FC;
+    }}
+
+    /* 메인 제목 */
+    h1, h2, h3 {{
+        color: var(--main-blue);
+        font-weight: 700;
+    }}
+
+    /* 사이드바 */
+    section[data-testid="stSidebar"] {{
+        background-color: var(--main-blue);
+    }}
+
+    section[data-testid="stSidebar"] * {{
+        color: #FFFFFF;
+    }}
+
+    section[data-testid="stSidebar"] div[role="radiogroup"] label {{
+        background-color: rgba(255,255,255,0.08);
+        border-radius: 8px;
+        padding: 8px;
+        margin-bottom: 5px;
+    }}
+
+    /* 버튼 */
+    div.stButton > button,
+    div.stFormSubmitButton > button,
+    div.stDownloadButton > button {{
+        background-color: var(--main-blue);
+        color: white;
+        border: none;
+        border-radius: 8px;
+        font-weight: 600;
+        min-height: 42px;
+    }}
+
+    div.stButton > button:hover,
+    div.stFormSubmitButton > button:hover,
+    div.stDownloadButton > button:hover {{
+        background-color: var(--point-green);
+        color: white;
+        border: none;
+    }}
+
+    /* 입력 요소 */
+    input:focus,
+    textarea:focus {{
+        border-color: var(--main-blue) !important;
+    }}
+
+    /* 메트릭 카드 */
+    div[data-testid="stMetric"] {{
+        background-color: #FFFFFF;
+        border: 1px solid #E2E8F0;
+        border-radius: 12px;
+        padding: 16px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+    }}
+
+    div[data-testid="stMetricLabel"] {{
+        color: #526174;
+        font-weight: 600;
+    }}
+
+    div[data-testid="stMetricValue"] {{
+        color: var(--main-blue);
+        font-weight: 700;
+    }}
+
+    /* 그래프 및 테이블 */
+    div[data-testid="stPlotlyChart"] {{
+        width: 100%;
+        overflow: hidden;
+    }}
+
+    div[data-testid="stDataFrame"] {{
+        width: 100%;
+        overflow-x: auto;
+    }}
+
+    /* 모바일 화면 */
+    @media screen and (max-width: 768px) {{
+        .block-container {{
+            padding-left: 0.8rem;
+            padding-right: 0.8rem;
+            padding-top: 1rem;
+        }}
+
+        h1 {{
+            font-size: 1.45rem !important;
+        }}
+
+        h2 {{
+            font-size: 1.25rem !important;
+        }}
+
+        h3 {{
+            font-size: 1.05rem !important;
+        }}
+
+        div[data-testid="stMetric"] {{
+            padding: 10px;
+            min-width: 0;
+        }}
+
+        div[data-testid="stMetricLabel"] {{
+            font-size: 0.78rem;
+        }}
+
+        div[data-testid="stMetricValue"] {{
+            font-size: 1.35rem;
+        }}
+
+        div[data-testid="stPlotlyChart"] {{
+            max-width: 100%;
+        }}
+
+        div[data-testid="stDataFrame"] {{
+            max-width: 100%;
+        }}
+
+        .stButton button,
+        .stDownloadButton button {{
+            width: 100%;
+        }}
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
 
 # =====================================================
 # 데이터베이스
@@ -68,14 +222,12 @@ def init_db():
     """)
 
     # 이전 버전 데이터 정리
-    # 대형폐기물 민원은 기타 민원으로 변경
     cur.execute("""
         UPDATE complaints
         SET category = '기타 민원'
         WHERE category = '대형폐기물 수거 지연'
     """)
 
-    # 문자 접수는 운영하지 않으므로 기타 경로로 변경
     cur.execute("""
         UPDATE complaints
         SET channel = '기타'
@@ -143,7 +295,6 @@ def create_demo_data():
         conn.close()
         return
 
-    # 대형폐기물 항목을 제외한 27건의 시연 데이터
     demo_categories = (
         ["재활용품 미수거"] * 9
         + ["음식물류 미수거"] * 6
@@ -173,7 +324,6 @@ def create_demo_data():
         location = f"{dong} 주민센터 인근"
         content = demo_contents[category]
 
-        # 지자체 경유 17건, 전화 10건
         channel = "지자체 경유" if i < 17 else "전화"
 
         received_date = (
@@ -315,15 +465,19 @@ def show_dashboard():
 
     df = load_complaints()
 
-    if df.empty:
-        st.info("등록된 민원이 없습니다.")
-        return
-
+    # 누적 민원 현황
     total = len(df)
-    completed = len(df[df["status"] == "처리 완료"])
-    pending = total - completed
-    high = len(df[df["priority"] == "HIGH"])
 
+    if not df.empty:
+        completed = len(df[df["status"] == "처리 완료"])
+        pending = total - completed
+        high = len(df[df["priority"] == "HIGH"])
+    else:
+        completed = 0
+        pending = 0
+        high = 0
+
+    # KPI 카드
     col1, col2, col3, col4 = st.columns(4)
 
     col1.metric("전체 민원", f"{total}건")
@@ -332,6 +486,10 @@ def show_dashboard():
     col4.metric("긴급 우선순위", f"{high}건")
 
     st.divider()
+
+    if df.empty:
+        st.info("등록된 민원이 없습니다.")
+        return
 
     left, right = st.columns(2)
 
@@ -350,11 +508,24 @@ def show_dashboard():
             y="민원 건수",
             text="민원 건수",
             color="dong",
-            title="행정동별 민원 건수"
+            title="행정동별 민원 건수",
+            color_discrete_sequence=[
+                MAIN_BLUE,
+                POINT_GREEN
+            ],
+            labels={
+                "dong": "행정동",
+                "민원 건수": "민원 건수"
+            }
         )
 
         fig = style_vertical_chart(fig)
-        st.plotly_chart(fig, use_container_width=True)
+        fig.update_xaxes(title_text="행정동")
+
+        st.plotly_chart(
+            fig,
+            use_container_width=True
+        )
 
     with right:
         st.subheader("우선순위별 민원 현황")
@@ -381,11 +552,27 @@ def show_dashboard():
             y="민원 건수",
             text="민원 건수",
             color="priority",
-            title="민원 우선순위"
+            title="민원 우선순위",
+            color_discrete_map={
+                "HIGH": "#D9534F",
+                "MEDIUM": "#F0AD4E",
+                "LOW": POINT_GREEN
+            },
+            labels={
+                "priority": "우선순위",
+                "민원 건수": "민원 건수"
+            }
         )
 
         fig = style_vertical_chart(fig)
-        st.plotly_chart(fig, use_container_width=True)
+
+        # x축 제목을 priority가 아닌 한글로 표시
+        fig.update_xaxes(title_text="우선순위")
+
+        st.plotly_chart(
+            fig,
+            use_container_width=True
+        )
 
     st.subheader("최근 접수 민원")
 
@@ -592,6 +779,11 @@ def show_complaint_management():
             index=channel_index
         )
 
+        edit_content = st.text_area(
+            "민원 내용",
+            value=complaint["content"]
+        )
+
         status_index = (
             STATUSES.index(complaint["status"])
             if complaint["status"] in STATUSES else 0
@@ -603,67 +795,65 @@ def show_complaint_management():
             index=status_index
         )
 
-        edit_content = st.text_area(
-            "민원 내용",
-            value=complaint["content"]
-        )
-
-        save = st.form_submit_button(
-            "수정 내용 저장",
+        submitted = st.form_submit_button(
+            "민원 정보 수정",
             use_container_width=True
         )
 
-    if save:
-        if not edit_location.strip() or not edit_content.strip():
-            st.warning("위치와 민원 내용을 입력해주세요.")
-        else:
-            priority, summary, message = analyze_complaint(
-                edit_content,
-                edit_category,
-                edit_dong,
-                edit_location
-            )
+        if submitted:
+            if not edit_location.strip() or not edit_content.strip():
+                st.warning("세부 위치와 민원 내용을 입력해주세요.")
+            else:
+                priority, summary, message = analyze_complaint(
+                    edit_content,
+                    edit_category,
+                    edit_dong,
+                    edit_location
+                )
 
-            conn = get_connection()
-            cur = conn.cursor()
+                conn = get_connection()
+                cur = conn.cursor()
 
-            cur.execute("""
-                UPDATE complaints
-                SET received_date = ?,
-                    dong = ?,
-                    location = ?,
-                    category = ?,
-                    channel = ?,
-                    content = ?,
-                    priority = ?,
-                    summary = ?,
-                    driver_message = ?,
-                    status = ?
-                WHERE id = ?
-            """, (
-                edit_date.isoformat(),
-                edit_dong,
-                edit_location,
-                edit_category,
-                edit_channel,
-                edit_content,
-                priority,
-                summary,
-                message,
-                edit_status,
-                selected_id
-            ))
+                cur.execute("""
+                    UPDATE complaints
+                    SET received_date = ?,
+                        dong = ?,
+                        location = ?,
+                        category = ?,
+                        channel = ?,
+                        content = ?,
+                        priority = ?,
+                        summary = ?,
+                        driver_message = ?,
+                        status = ?
+                    WHERE id = ?
+                """, (
+                    edit_date.isoformat(),
+                    edit_dong,
+                    edit_location,
+                    edit_category,
+                    edit_channel,
+                    edit_content,
+                    priority,
+                    summary,
+                    message,
+                    edit_status,
+                    selected_id
+                ))
 
-            conn.commit()
-            conn.close()
+                conn.commit()
+                conn.close()
 
-            st.success("민원 정보가 수정되었습니다.")
-            st.rerun()
+                st.success("민원 정보가 수정되었습니다.")
+                st.rerun()
 
     st.divider()
     st.subheader("기사 전달 메시지")
 
-    st.code(complaint["driver_message"], language="text")
+    st.code(
+        complaint["driver_message"],
+        language="text"
+    )
 
     if st.button("기사 전달 이력 저장", key="dispatch"):
         conn = get_connection()
@@ -755,7 +945,11 @@ def show_statistics():
         orientation="h",
         text="민원 건수",
         color="dong",
-        title="행정동별 민원 건수"
+        title="행정동별 민원 건수",
+        color_discrete_sequence=[
+            MAIN_BLUE,
+            POINT_GREEN
+        ]
     )
 
     fig = style_horizontal_chart(
@@ -793,7 +987,11 @@ def show_statistics():
         orientation="h",
         text="민원 건수",
         color="category",
-        title="민원 유형별 건수"
+        title="민원 유형별 건수",
+        color_discrete_sequence=[
+            MAIN_BLUE,
+            POINT_GREEN
+        ]
     )
 
     fig = style_horizontal_chart(
@@ -802,7 +1000,6 @@ def show_statistics():
         left_margin=200
     )
 
-    # 유형별 그래프 제목과 글자 가독성 추가 개선
     fig.update_layout(
         title=dict(
             text="민원 유형별 건수",
@@ -853,7 +1050,11 @@ def show_statistics():
         y="민원 건수",
         text="민원 건수",
         color="channel",
-        title="접수 경로별 민원 건수"
+        title="접수 경로별 민원 건수",
+        color_discrete_sequence=[
+            MAIN_BLUE,
+            POINT_GREEN
+        ]
     )
 
     fig = style_vertical_chart(fig, height=350)
@@ -893,10 +1094,22 @@ def show_statistics():
         y="민원 건수",
         text="민원 건수",
         color="priority",
-        title="우선순위별 민원 건수"
+        title="우선순위별 민원 건수",
+        color_discrete_map={
+            "HIGH": "#D9534F",
+            "MEDIUM": "#F0AD4E",
+            "LOW": POINT_GREEN
+        },
+        labels={
+            "priority": "우선순위",
+            "민원 건수": "민원 건수"
+        }
     )
 
     fig = style_vertical_chart(fig, height=350)
+
+    # 우선순위 축 제목 한글 표시
+    fig.update_xaxes(title_text="우선순위")
 
     st.plotly_chart(fig, use_container_width=True)
 
@@ -986,3 +1199,4 @@ elif menu == "민원 관리":
 
 elif menu == "통계 분석":
     show_statistics()
+
